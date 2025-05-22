@@ -43,7 +43,7 @@ from peft.utils import (
     get_quantization_config,
 )
 #### Todo: import function of new methods here #### 
-from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
+from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties, sce
 from peft.utils.other import get_pattern_key
 
 from .aqlm import dispatch_aqlm
@@ -557,7 +557,7 @@ class LoraModel(BaseTuner):
 
         adapters_ranks = [self.peft_config[adapter].r for adapter in adapters]
         #### Todo: remember to add func names of new methods here here ####
-        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune"):
+        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune","sce"):
             # all adapters ranks should be same, new rank is just this value
             if len(set(adapters_ranks)) != 1:
                 raise ValueError(
@@ -725,10 +725,47 @@ class LoraModel(BaseTuner):
                         driver=svd_driver,
                     )
                 #### Todo: remember to add func names of new methods here here ####
-                elif combination_type in ["linear", "ties", "dare_linear", "dare_ties", "magnitude_prune"]:
-                    target_lora_A.data, target_lora_B.data = self._generalized_task_arithmetic_weighted_adapter(
-                        combination_type, adapters, weights, target, density, majority_sign_method
-                    )
+                elif combination_type in ["linear", "ties", "dare_linear", "dare_ties", "magnitude_prune", "sce"]:
+                    # Prepare task tensors for merging
+                    lora_A_deltas = []
+                    lora_B_deltas = []
+                    valid_weights = []
+                    for adapter, weight in zip(adapters, weights):
+                        if adapter in target.lora_A:
+                            current_adapter_lora_A = target.lora_A[adapter].weight
+                            current_adapter_lora_B = target.lora_B[adapter].weight
+                        elif adapter in target.lora_embedding_A:
+                            current_adapter_lora_A = target.lora_embedding_A[adapter]
+                            current_adapter_lora_B = target.lora_embedding_B[adapter]
+                        else:
+                            continue
+                        valid_weights.append(weight * target.scaling[adapter])
+                        lora_A_deltas.append(current_adapter_lora_A.data)
+                        lora_B_deltas.append(current_adapter_lora_B.data)
+                    valid_weights_tensor = torch.tensor(valid_weights).to(lora_A_deltas[0].device)
+                    # Merge according to combination_type
+                    if combination_type == "linear":
+                        merged_A = task_arithmetic(lora_A_deltas, valid_weights_tensor)
+                        merged_B = task_arithmetic(lora_B_deltas, valid_weights_tensor)
+                    elif combination_type == "ties":
+                        merged_A = ties(lora_A_deltas, valid_weights_tensor, density, majority_sign_method)
+                        merged_B = ties(lora_B_deltas, valid_weights_tensor, density, majority_sign_method)
+                    elif combination_type == "dare_linear":
+                        merged_A = dare_linear(lora_A_deltas, valid_weights_tensor, density)
+                        merged_B = dare_linear(lora_B_deltas, valid_weights_tensor, density)
+                    elif combination_type == "dare_ties":
+                        merged_A = dare_ties(lora_A_deltas, valid_weights_tensor, density, majority_sign_method)
+                        merged_B = dare_ties(lora_B_deltas, valid_weights_tensor, density, majority_sign_method)
+                    elif combination_type == "magnitude_prune":
+                        merged_A = magnitude_prune(lora_A_deltas, valid_weights_tensor, density)
+                        merged_B = magnitude_prune(lora_B_deltas, valid_weights_tensor, density)
+                    elif combination_type == "sce":
+                        merged_A = sce(lora_A_deltas, valid_weights_tensor, density, majority_sign_method)
+                        merged_B = sce(lora_B_deltas, valid_weights_tensor, density, majority_sign_method)
+                    else:
+                        raise ValueError(f"Unknown combination_type: {combination_type}")
+                    target_lora_A.data.copy_(merged_A)
+                    target_lora_B.data.copy_(merged_B)
 
     def _svd_generalized_task_arithmetic_weighted_adapter(
         self,
